@@ -614,6 +614,7 @@ struct TargetUser {
 	gid_t gid = 0;
 	std::string name;
 	std::string home;
+	std::vector<gid_t> groups; /* supplementary groups, resolved in the parent */
 };
 
 static TargetUser resolve_target_user(const std::string &want)
@@ -653,6 +654,27 @@ static TargetUser resolve_target_user(const std::string &want)
 		t.gid = pw->pw_gid;
 		t.name = pw->pw_name;
 		t.home = pw->pw_dir ? pw->pw_dir : "";
+
+		/* Resolve the supplementary group list here, in the parent,
+		 * BEFORE the child is forked and joined to the traced scope.
+		 * getgrouplist() goes through NSS (nss-systemd's userdb chase
+		 * on some distros opens '/' and probes the userdb dirs dozens
+		 * of times); doing it in the child after it joins the cgroup
+		 * would attribute all of those opens to the traced command. The
+		 * child then only needs setgroups() with this precomputed list,
+		 * which touches no files. */
+		int ng = 0;
+		getgrouplist(t.name.c_str(), t.gid, nullptr, &ng);
+		if (ng < 1)
+			ng = 1;
+		t.groups.resize(ng);
+		if (getgrouplist(t.name.c_str(), t.gid, t.groups.data(), &ng) < 0) {
+			/* group set changed under us / still too small: fall back
+			 * to the primary group alone rather than risk a stale set */
+			t.groups.assign(1, t.gid);
+		} else {
+			t.groups.resize(ng);
+		}
 	}
 	return t;
 }
@@ -662,10 +684,15 @@ static bool drop_privileges(const TargetUser &t)
 {
 	if (!t.drop || geteuid() != 0)
 		return true;
-	if (t.name.empty()) {
-		if (setgroups(1, &t.gid) != 0)
+	/* Apply the supplementary groups resolved in the parent (see
+	 * resolve_target_user). We deliberately avoid initgroups() here: it does
+	 * an NSS lookup, and this code runs in the child after it has joined the
+	 * traced scope, so those opens would pollute the trace. setgroups() is a
+	 * pure syscall. */
+	if (!t.groups.empty()) {
+		if (setgroups(t.groups.size(), t.groups.data()) != 0)
 			return false;
-	} else if (initgroups(t.name.c_str(), t.gid) != 0) {
+	} else if (setgroups(1, &t.gid) != 0) {
 		return false;
 	}
 	if (setgid(t.gid) != 0)
