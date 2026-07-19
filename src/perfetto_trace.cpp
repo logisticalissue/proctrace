@@ -33,6 +33,15 @@ static void putUint(std::string &out, uint32_t field, uint64_t v)
 	putVarint(out, v);
 }
 
+static void putFixed64(std::string &out, uint32_t field, uint64_t v)
+{
+	putTag(out, field, 1);
+	for (unsigned int i = 0; i < 8; i++) {
+		out.push_back((char)(v & 0xff));
+		v >>= 8;
+	}
+}
+
 /* wire type 2: length-delimited (string or nested message) */
 static void putBytes(std::string &out, uint32_t field, const std::string &b)
 {
@@ -85,7 +94,8 @@ std::string TraceWriter::debugAnnotation(const Annotation &a)
  * instant names (open paths, "exit code N") recur, so they are interned. */
 std::string TraceWriter::trackEvent(int type, uint64_t track_uuid,
 				    const std::string *name, bool intern_name,
-				    const std::vector<Annotation> *annots)
+				    const std::vector<Annotation> *annots,
+				    uint64_t flow_id, bool terminate_flow)
 {
 	std::string m;
 	putUint(m, 9, (uint64_t)type);
@@ -100,6 +110,8 @@ std::string TraceWriter::trackEvent(int type, uint64_t track_uuid,
 	if (annots)
 		for (const auto &a : *annots)
 			putBytes(m, 4, debugAnnotation(a));
+	if (flow_id)
+		putFixed64(m, terminate_flow ? 48 : 47, flow_id);
 	return m;
 }
 
@@ -179,6 +191,24 @@ void TraceWriter::overviewLane(uint64_t uuid, uint64_t parent_uuid,
 	writePacket(pkt);
 }
 
+void TraceWriter::nativeProcess(uint64_t uuid, uint32_t pid,
+				uint64_t start_ts_ns, const std::string &name)
+{
+	std::string process;
+	putUint(process, 1, pid);          /* ProcessDescriptor.pid */
+	putBytes(process, 6, name);        /* process_name */
+	putUint(process, 7, start_ts_ns);  /* start_timestamp_ns */
+
+	std::string td;
+	putUint(td, 1, uuid);
+	putBytes(td, 2, name);
+	putBytes(td, 3, process);          /* TrackDescriptor.process */
+
+	std::string pkt;
+	putBytes(pkt, 60, td);
+	writePacket(pkt);
+}
+
 void TraceWriter::counterTrack(uint64_t uuid, uint64_t parent_uuid,
 			       const std::string &name, const std::string &unit)
 {
@@ -189,7 +219,8 @@ void TraceWriter::counterTrack(uint64_t uuid, uint64_t parent_uuid,
 	std::string td;
 	putUint(td, 1, uuid);
 	putBytes(td, 2, name);
-	putUint(td, 5, parent_uuid);
+	if (parent_uuid)
+		putUint(td, 5, parent_uuid);
 	putBytes(td, 8, counter);         /* counter descriptor */
 
 	std::string pkt;
@@ -242,6 +273,30 @@ void TraceWriter::instant(uint64_t track_uuid, uint64_t ts,
 	putUint(pkt, 58, 3);
 	putBytes(pkt, 11, ev);
 	writePacket(pkt, /*needs_incremental=*/true);
+}
+
+void TraceWriter::flowPoint(uint64_t track_uuid, uint64_t ts,
+			    const std::string &name, uint64_t flow_id)
+{
+	std::string ev = trackEvent(3, track_uuid, &name, true, nullptr,
+				    flow_id, false);
+	std::string pkt;
+	putUint(pkt, 8, ts);
+	putUint(pkt, 58, 3);
+	putBytes(pkt, 11, ev);
+	writePacket(pkt, true);
+}
+
+void TraceWriter::flowEnd(uint64_t track_uuid, uint64_t ts,
+			  const std::string &name, uint64_t flow_id)
+{
+	std::string ev = trackEvent(3, track_uuid, &name, true, nullptr,
+				    flow_id, true);
+	std::string pkt;
+	putUint(pkt, 8, ts);
+	putUint(pkt, 58, 3);
+	putBytes(pkt, 11, ev);
+	writePacket(pkt, true);
 }
 
 void TraceWriter::counter(uint64_t track_uuid, uint64_t ts, int64_t value)

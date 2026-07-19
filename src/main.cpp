@@ -40,6 +40,7 @@
 
 struct Proc {
 	uint64_t thread_uuid = 0; /* compact overview lane (holds slices) */
+	uint64_t fork_flow_id = 0;
 	uint64_t start_ts = 0;
 	uint32_t pid = 0;
 	uint32_t ppid = 0;
@@ -58,17 +59,20 @@ struct Stats {
 
 class Model {
 public:
-	Model(pt::TraceWriter &w, const std::string &command, bool trace_opens)
-		: w_(w), trace_opens_(trace_opens),
+	Model(pt::TraceWriter &w, const std::string &command, bool trace_opens,
+	      bool native_layout)
+		: w_(w), trace_opens_(trace_opens), native_layout_(native_layout),
 		  page_kb_(sysconf(_SC_PAGESIZE) / 1024)
 	{
-		w_.overviewRoot(kOverviewUuid,
-				"proctrace: " + ellipsize(command, 120));
-		w_.counterTrack(kActiveUuid, kOverviewUuid, "Active processes");
-		w_.counterTrack(kFailedOpenUuid, kOverviewUuid, "Failed opens");
-		w_.counterTrack(kReadBytesUuid, kOverviewUuid,
+		if (!native_layout_)
+			w_.overviewRoot(kOverviewUuid,
+					"proctrace: " + ellipsize(command, 120));
+		uint64_t parent = native_layout_ ? 0 : kOverviewUuid;
+		w_.counterTrack(kActiveUuid, parent, "Active processes");
+		w_.counterTrack(kFailedOpenUuid, parent, "Failed opens");
+		w_.counterTrack(kReadBytesUuid, parent,
 				"Cumulative bytes read", "bytes");
-		w_.counterTrack(kWriteBytesUuid, kOverviewUuid,
+		w_.counterTrack(kWriteBytesUuid, parent,
 				"Cumulative bytes written", "bytes");
 	}
 
@@ -80,9 +84,19 @@ public:
 		uint32_t tgid = e->hdr.pid;
 		if (live_.count(tgid))
 			return;
+		Proc &parent = ensure(e->parent_pid, e->hdr.ts_ns);
 		Proc &p = ensure(tgid, e->hdr.ts_ns);
 		p.ppid = e->parent_pid;
 		relabel(p, e->comm);
+		p.fork_flow_id = next_flow_id_++;
+		w_.flowPoint(parent.thread_uuid, e->hdr.ts_ns,
+			     "fork " + std::to_string(tgid), p.fork_flow_id);
+		/* Every fork gets a visible parent -> child connection, including
+		 * shell subprocesses which run builtins and exit without exec. Keep the
+		 * flow open so an eventual exec becomes its final step. Perfetto infers
+		 * flow direction from timestamps, hence the 1 ns ordering offset. */
+		w_.flowPoint(p.thread_uuid, e->hdr.ts_ns + 1,
+			     "forked", p.fork_flow_id);
 	}
 
 	void onExec(const pt_exec_event *e)
@@ -108,8 +122,11 @@ public:
 		p.label = cmd; /* remembered for the teardown summary */
 		/* Re-emitting a generic descriptor updates its display name. Keep
 		 * enough argv to distinguish parallel compiler jobs, plus the PID. */
-		w_.overviewLane(p.thread_uuid, kOverviewUuid,
-				laneLabel(cmd, tgid));
+		describe(p, laneLabel(cmd, tgid));
+		if (p.fork_flow_id) {
+			w_.flowEnd(p.thread_uuid, e->hdr.ts_ns, "exec", p.fork_flow_id);
+			p.fork_flow_id = 0;
+		}
 		std::vector<pt::Annotation> a = {
 			pt::Annotation::s("filename", e->filename),
 			pt::Annotation::n("pid", tgid),
@@ -541,8 +558,15 @@ private:
 		if (p.comm == comm)
 			return;
 		p.comm = comm;
-		w_.overviewLane(p.thread_uuid, kOverviewUuid,
-				laneLabel(p.comm, p.pid));
+		describe(p, laneLabel(p.comm, p.pid));
+	}
+
+	void describe(const Proc &p, const std::string &name)
+	{
+		if (native_layout_)
+			w_.nativeProcess(p.thread_uuid, p.pid, p.start_ts, name);
+		else
+			w_.overviewLane(p.thread_uuid, kOverviewUuid, name);
 	}
 
 	Proc &ensure(uint32_t tgid, uint64_t ts)
@@ -562,8 +586,7 @@ private:
 		p.start_ts = ts;
 		p.thread_uuid = next_uuid_++;
 		p.comm = "?";
-		w_.overviewLane(p.thread_uuid, kOverviewUuid,
-				"pid " + std::to_string(tgid));
+		describe(p, "pid " + std::to_string(tgid));
 		auto inserted = live_.emplace(tgid, std::move(p));
 		w_.counter(kActiveUuid, ts, live_.size());
 		return inserted.first->second;
@@ -576,6 +599,7 @@ private:
 
 	pt::TraceWriter &w_;
 	bool trace_opens_;
+	bool native_layout_;
 	int64_t page_kb_;
 	std::unordered_map<uint32_t, Proc> live_;
 	static constexpr uint64_t kOverviewUuid = 0x100;
@@ -584,6 +608,7 @@ private:
 	static constexpr uint64_t kReadBytesUuid = kOverviewUuid + 3;
 	static constexpr uint64_t kWriteBytesUuid = kOverviewUuid + 4;
 	uint64_t next_uuid_ = kOverviewUuid + 5;
+	uint64_t next_flow_id_ = 1;
 	uint64_t read_bytes_ = 0;
 	uint64_t write_bytes_ = 0;
 	bool counters_started_ = false;
@@ -658,6 +683,7 @@ struct Options {
 	std::string scope = "auto";
 	std::string user;         /* run the command as this user (else auto) */
 	std::string summary_json; /* also write a JSON summary sidecar here    */
+	std::string layout = "compact";
 	bool trace_opens = true;
 	bool summary = true;      /* print the teardown summary to stderr      */
 	std::vector<char *> argv; /* command to run */
@@ -667,6 +693,7 @@ static void usage(const char *p)
 {
 	fprintf(stderr,
 		"usage: %s [-o out.pftrace] [--scope auto|cgroup|pidtree] "
+		"[--layout compact|native] "
 		"[--user NAME] [--no-opens] [--no-summary] "
 		"[--summary-json FILE] -- <command> [args...]\n", p);
 }
@@ -793,6 +820,8 @@ int main(int argc, char **argv)
 			opt.scope = argv[++i];
 		else if (a == "--user" && i + 1 < argc)
 			opt.user = argv[++i];
+		else if (a == "--layout" && i + 1 < argc)
+			opt.layout = argv[++i];
 		else if (a == "--no-opens")
 			opt.trace_opens = false;
 		else if (a == "--no-summary")
@@ -808,6 +837,11 @@ int main(int argc, char **argv)
 		opt.argv.push_back(argv[i]);
 	if (opt.argv.empty()) {
 		usage(argv[0]);
+		return 2;
+	}
+	if (opt.layout != "compact" && opt.layout != "native") {
+		fprintf(stderr, "invalid layout '%s' (expected compact or native)\n",
+			opt.layout.c_str());
 		return 2;
 	}
 	opt.argv.push_back(nullptr);
@@ -929,7 +963,7 @@ int main(int argc, char **argv)
 		if (k) cmdstr += ' ';
 		cmdstr += opt.argv[k];
 	}
-	Model model(writer, cmdstr, opt.trace_opens);
+	Model model(writer, cmdstr, opt.trace_opens, opt.layout == "native");
 
 	struct ring_buffer *rb =
 		ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event,

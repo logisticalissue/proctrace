@@ -66,6 +66,10 @@ public:
 	void overviewRoot(uint64_t uuid, const std::string &name);
 	void overviewLane(uint64_t uuid, uint64_t parent_uuid,
 			  const std::string &name);
+	/* Native process descriptors make these lanes interoperable with system
+	 * traces. They intentionally do not have an overview parent. */
+	void nativeProcess(uint64_t uuid, uint32_t pid, uint64_t start_ts_ns,
+			   const std::string &name);
 	void counterTrack(uint64_t uuid, uint64_t parent_uuid,
 			  const std::string &name, const std::string &unit = {});
 
@@ -80,6 +84,12 @@ public:
 	void instant(uint64_t track_uuid, uint64_t ts_ns,
 		     const std::string &name,
 		     const std::vector<Annotation> &annots = {});
+	/* A flow originates or passes through flowPoint events and terminates on
+	 * flowEnd. Direction is inferred from event timestamps. */
+	void flowPoint(uint64_t track_uuid, uint64_t ts_ns,
+		       const std::string &name, uint64_t flow_id);
+	void flowEnd(uint64_t track_uuid, uint64_t ts_ns,
+		     const std::string &name, uint64_t flow_id);
 	void counter(uint64_t track_uuid, uint64_t ts_ns, int64_t value);
 
 	/* Correlate CLOCK_MONOTONIC (our event timestamps) with wall clock. */
@@ -91,7 +101,8 @@ private:
 	void writePacket(std::string &packet, bool needs_incremental = false);
 	std::string trackEvent(int type, uint64_t track_uuid,
 			       const std::string *name, bool intern_name,
-			       const std::vector<Annotation> *annots);
+			       const std::vector<Annotation> *annots,
+			       uint64_t flow_id = 0, bool terminate_flow = false);
 	std::string debugAnnotation(const Annotation &a);
 
 	/* Intern a string into one namespace; returns its iid and appends a new
