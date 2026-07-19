@@ -272,6 +272,26 @@ int handle_exec(u64 *ctx)
 		bpf_map_delete_elem(&execve_argv, &key);
 	}
 
+	/* The syscall-entry tracepoint normally fills this, but in certain
+	 * cases it might not habe been available, so use this as a fallback. */
+	if (e->argv_len == 0) {
+		struct mm_struct *mm = BPF_CORE_READ(p, mm);
+		if (mm) {
+			unsigned long start = BPF_CORE_READ(mm, arg_start);
+			unsigned long end = BPF_CORE_READ(mm, arg_end);
+			if (end > start) {
+				unsigned long span = end - start;
+				__u32 n = span > ARGV_BUF_SZ ? ARGV_BUF_SZ : (__u32)span;
+				if (!bpf_probe_read_user(e->argv, n,
+							 (const void *)start)) {
+					e->argv_len = n;
+					e->arg_count = BPF_CORE_READ(bprm, argc);
+					e->truncated = span > ARGV_BUF_SZ;
+				}
+			}
+		}
+	}
+
 	__u32 fixed = __builtin_offsetof(struct pt_exec_event, argv);
 	__u32 len = e->argv_len;
 	if (len > ARGV_BUF_SZ)
