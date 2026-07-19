@@ -41,6 +41,8 @@
 struct Proc {
 	uint64_t thread_uuid = 0; /* compact overview lane (holds slices) */
 	uint64_t fork_flow_id = 0;
+	uint64_t fork_parent_uuid = 0;
+	uint64_t fork_ts = 0;
 	uint64_t start_ts = 0;
 	uint32_t pid = 0;
 	uint32_t ppid = 0;
@@ -92,14 +94,10 @@ public:
 		p.ppid = e->parent_pid;
 		relabel(p, e->comm);
 		p.fork_flow_id = next_flow_id_++;
-		w_.flowPoint(parent.thread_uuid, e->hdr.ts_ns,
-			     "fork " + std::to_string(tgid), p.fork_flow_id);
-		/* Every fork gets a visible parent -> child connection, including
-		 * shell subprocesses which run builtins and exit without exec. Keep the
-		 * flow open so an eventual exec becomes its final step. Perfetto infers
-		 * flow direction from timestamps, hence the 1 ns ordering offset. */
-		w_.flowPoint(p.thread_uuid, e->hdr.ts_ns + 1,
-			     "forked", p.fork_flow_id);
+		p.fork_parent_uuid = parent.thread_uuid;
+		p.fork_ts = e->hdr.ts_ns;
+		/* onExec learns the useful child name. Delay this flow until then so
+		 * its arrow endpoints identify the command rather than only its PID. */
 	}
 
 	void onExec(const pt_exec_event *e)
@@ -123,13 +121,10 @@ public:
 
 		std::string cmd = cmdline(e);
 		p.label = cmd; /* remembered for the teardown summary */
+		emitForkFlow(p, cmd, e->hdr.ts_ns, true);
 		/* Re-emitting a generic descriptor updates its display name. Keep
 		 * enough argv to distinguish parallel compiler jobs, plus the PID. */
 		describe(p, laneLabel(cmd, tgid));
-		if (p.fork_flow_id) {
-			w_.flowEnd(p.thread_uuid, e->hdr.ts_ns, "exec", p.fork_flow_id);
-			p.fork_flow_id = 0;
-		}
 		std::vector<pt::Annotation> a = {
 			pt::Annotation::s("filename", e->filename),
 			pt::Annotation::n("pid", tgid),
@@ -212,6 +207,9 @@ public:
 		stats_.exits++;
 		uint32_t tgid = e->hdr.pid;
 		Proc &p = ensure(tgid, e->hdr.ts_ns);
+		if (p.fork_flow_id)
+			emitForkFlow(p, p.comm.empty() ? std::string(e->comm) : p.comm,
+				     p.fork_ts + 2, false);
 		if (!p.slice_open) {
 			w_.sliceBegin(p.thread_uuid, p.start_ts,
 				      p.comm.empty() ? std::string(e->comm) : p.comm);
@@ -271,6 +269,9 @@ public:
 	{
 		bool had_live = !live_.empty();
 		for (auto &kv : live_) {
+			if (kv.second.fork_flow_id)
+				emitForkFlow(kv.second, kv.second.comm,
+					     kv.second.fork_ts + 2, false);
 			if (kv.second.slice_open)
 				w_.sliceEnd(kv.second.thread_uuid, ts);
 			recordProc(kv.second, ts); /* count procs alive at teardown */
@@ -358,6 +359,24 @@ public:
 	}
 
 private:
+	void emitForkFlow(Proc &p, const std::string &command, uint64_t end_ts,
+			  bool did_exec)
+	{
+		if (!p.fork_flow_id)
+			return;
+		std::string child = ellipsize(command.empty() ? "?" : command, 96);
+		std::string label = child + " [" + std::to_string(p.pid) + "]";
+		w_.flowPoint(p.fork_parent_uuid, p.fork_ts, "fork " + label,
+			     p.fork_flow_id);
+		/* Keep the actual fork as an intermediate point if exec happens later.
+		 * Perfetto infers flow direction from the event timestamps. */
+		w_.flowPoint(p.thread_uuid, p.fork_ts + 1, "spawn " + label,
+			     p.fork_flow_id);
+		w_.flowEnd(p.thread_uuid, std::max(end_ts, p.fork_ts + 2),
+			   (did_exec ? "exec " : "spawn ") + label, p.fork_flow_id);
+		p.fork_flow_id = 0;
+	}
+
 	/* ---- summary aggregation ---- */
 	struct ProcSummary { uint64_t dur_ns; uint32_t pid; std::string label; };
 	struct PathStat { uint64_t opens = 0; uint64_t enoent = 0; };
