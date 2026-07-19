@@ -179,6 +179,24 @@ void TraceWriter::overviewLane(uint64_t uuid, uint64_t parent_uuid,
 	writePacket(pkt);
 }
 
+void TraceWriter::counterTrack(uint64_t uuid, uint64_t parent_uuid,
+			       const std::string &name, const std::string &unit)
+{
+	std::string counter;
+	if (!unit.empty())
+		putBytes(counter, 6, unit);     /* CounterDescriptor.unit_name */
+
+	std::string td;
+	putUint(td, 1, uuid);
+	putBytes(td, 2, name);
+	putUint(td, 5, parent_uuid);
+	putBytes(td, 8, counter);         /* counter descriptor */
+
+	std::string pkt;
+	putBytes(pkt, 60, td);
+	writePacket(pkt);
+}
+
 void TraceWriter::sliceBegin(uint64_t track_uuid, uint64_t ts,
 			     const std::string &name,
 			     const std::vector<Annotation> &annots)
@@ -224,6 +242,17 @@ void TraceWriter::instant(uint64_t track_uuid, uint64_t ts,
 	putUint(pkt, 58, 3);
 	putBytes(pkt, 11, ev);
 	writePacket(pkt, /*needs_incremental=*/true);
+}
+
+void TraceWriter::counter(uint64_t track_uuid, uint64_t ts, int64_t value)
+{
+	std::string ev = trackEvent(4, track_uuid, nullptr, false, nullptr);
+	putInt(ev, 30, value);            /* TrackEvent.counter_value */
+	std::string pkt;
+	putUint(pkt, 8, ts);
+	putUint(pkt, 58, 3);
+	putBytes(pkt, 11, ev);
+	writePacket(pkt);
 }
 
 void TraceWriter::clockSnapshot(uint64_t mono_ns, uint64_t boot_ns,

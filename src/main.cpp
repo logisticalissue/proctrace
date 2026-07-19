@@ -64,6 +64,12 @@ public:
 	{
 		w_.overviewRoot(kOverviewUuid,
 				"proctrace: " + ellipsize(command, 120));
+		w_.counterTrack(kActiveUuid, kOverviewUuid, "Active processes");
+		w_.counterTrack(kFailedOpenUuid, kOverviewUuid, "Failed opens");
+		w_.counterTrack(kReadBytesUuid, kOverviewUuid,
+				"Cumulative bytes read", "bytes");
+		w_.counterTrack(kWriteBytesUuid, kOverviewUuid,
+				"Cumulative bytes written", "bytes");
 	}
 
 	void onFork(const pt_fork_event *e)
@@ -132,9 +138,10 @@ public:
 		std::string raw(e->path, strnlen_(e->path, e->path_len));
 		std::string path = resolve(p, e->dfd, raw);
 		bool fail = e->ret < 0;
-		if (fail)
+		if (fail) {
 			stats_.open_fail++;
-		else
+			w_.counter(kFailedOpenUuid, e->hdr.ts_ns, stats_.open_fail);
+		} else
 			p.fds[(int)e->ret] = path; /* for later dfd resolution */
 
 		/* aggregate for the summary: opens per path + ENOENT storms */
@@ -145,11 +152,12 @@ public:
 
 		std::string status = fail ? std::string("-") + strerror((int)-e->ret)
 					  : "fd " + std::to_string(e->ret);
-		std::string name = (fail ? "open! " : "open ") + path;
+		std::string name = fail ? "open " + errnoName((int)-e->ret) : "open";
 
 		char flagbuf[16];
 		std::snprintf(flagbuf, sizeof(flagbuf), "0x%x", e->flags);
 		std::vector<pt::Annotation> a = {
+			pt::Annotation::s("path", path),
 			pt::Annotation::s("status", status),
 			pt::Annotation::n("ret", e->ret),
 			pt::Annotation::n("dfd", e->dfd),
@@ -203,23 +211,31 @@ public:
 		 * kernel), so they land on the slice with no correlation dance. */
 		if (e->has_stats) {
 			w_.sliceEnd(p.thread_uuid, e->hdr.ts_ns, statAnnots(e));
+			read_bytes_ += e->read_bytes;
+			write_bytes_ += e->write_bytes;
+			w_.counter(kReadBytesUuid, e->hdr.ts_ns, read_bytes_);
+			w_.counter(kWriteBytesUuid, e->hdr.ts_ns, write_bytes_);
 			stats_.rstats++;
 		} else {
 			w_.sliceEnd(p.thread_uuid, e->hdr.ts_ns);
 		}
 		recordProc(p, e->hdr.ts_ns);
 		live_.erase(tgid);
+		w_.counter(kActiveUuid, e->hdr.ts_ns, live_.size());
 	}
 
 	/* close anything still running (early stop / SIGKILLed subtree) */
 	void finalize(uint64_t ts)
 	{
+		bool had_live = !live_.empty();
 		for (auto &kv : live_) {
 			if (kv.second.slice_open)
 				w_.sliceEnd(kv.second.thread_uuid, ts);
 			recordProc(kv.second, ts); /* count procs alive at teardown */
 		}
 		live_.clear();
+		if (had_live)
+			w_.counter(kActiveUuid, ts, 0);
 	}
 
 	const Stats &stats() const { return stats_; }
@@ -391,6 +407,33 @@ private:
 		return n;
 	}
 
+	static std::string errnoName(int err)
+	{
+		switch (err) {
+		case EACCES: return "EACCES";
+		case EEXIST: return "EEXIST";
+		case EFAULT: return "EFAULT";
+		case EINTR: return "EINTR";
+		case EINVAL: return "EINVAL";
+		case EIO: return "EIO";
+		case EISDIR: return "EISDIR";
+		case ELOOP: return "ELOOP";
+		case EMFILE: return "EMFILE";
+		case ENAMETOOLONG: return "ENAMETOOLONG";
+		case ENFILE: return "ENFILE";
+		case ENOENT: return "ENOENT";
+		case ENOMEM: return "ENOMEM";
+		case ENOSPC: return "ENOSPC";
+		case ENOTDIR: return "ENOTDIR";
+		case ENXIO: return "ENXIO";
+		case EOVERFLOW: return "EOVERFLOW";
+		case EPERM: return "EPERM";
+		case EROFS: return "EROFS";
+		case ETXTBSY: return "ETXTBSY";
+		default: return "errno " + std::to_string(err);
+		}
+	}
+
 	static std::string cmdline(const pt_exec_event *e)
 	{
 		if (e->argv_len == 0)
@@ -507,6 +550,13 @@ private:
 		auto it = live_.find(tgid);
 		if (it != live_.end())
 			return it->second;
+		if (!counters_started_) {
+			w_.counter(kActiveUuid, ts, 0);
+			w_.counter(kFailedOpenUuid, ts, 0);
+			w_.counter(kReadBytesUuid, ts, 0);
+			w_.counter(kWriteBytesUuid, ts, 0);
+			counters_started_ = true;
+		}
 		Proc p;
 		p.pid = tgid;
 		p.start_ts = ts;
@@ -514,7 +564,9 @@ private:
 		p.comm = "?";
 		w_.overviewLane(p.thread_uuid, kOverviewUuid,
 				"pid " + std::to_string(tgid));
-		return live_.emplace(tgid, std::move(p)).first->second;
+		auto inserted = live_.emplace(tgid, std::move(p));
+		w_.counter(kActiveUuid, ts, live_.size());
+		return inserted.first->second;
 	}
 
 	static std::string laneLabel(const std::string &command, uint32_t pid)
@@ -527,7 +579,14 @@ private:
 	int64_t page_kb_;
 	std::unordered_map<uint32_t, Proc> live_;
 	static constexpr uint64_t kOverviewUuid = 0x100;
-	uint64_t next_uuid_ = kOverviewUuid + 1;
+	static constexpr uint64_t kActiveUuid = kOverviewUuid + 1;
+	static constexpr uint64_t kFailedOpenUuid = kOverviewUuid + 2;
+	static constexpr uint64_t kReadBytesUuid = kOverviewUuid + 3;
+	static constexpr uint64_t kWriteBytesUuid = kOverviewUuid + 4;
+	uint64_t next_uuid_ = kOverviewUuid + 5;
+	uint64_t read_bytes_ = 0;
+	uint64_t write_bytes_ = 0;
+	bool counters_started_ = false;
 	Stats stats_;
 
 	/* summary state: one record per finished process, one entry per unique

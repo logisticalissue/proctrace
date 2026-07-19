@@ -66,6 +66,8 @@ public:
 	void overviewRoot(uint64_t uuid, const std::string &name);
 	void overviewLane(uint64_t uuid, uint64_t parent_uuid,
 			  const std::string &name);
+	void counterTrack(uint64_t uuid, uint64_t parent_uuid,
+			  const std::string &name, const std::string &unit = {});
 
 	void sliceBegin(uint64_t track_uuid, uint64_t ts_ns,
 			const std::string &name,
@@ -78,6 +80,7 @@ public:
 	void instant(uint64_t track_uuid, uint64_t ts_ns,
 		     const std::string &name,
 		     const std::vector<Annotation> &annots = {});
+	void counter(uint64_t track_uuid, uint64_t ts_ns, int64_t value);
 
 	/* Correlate CLOCK_MONOTONIC (our event timestamps) with wall clock. */
 	void clockSnapshot(uint64_t mono_ns, uint64_t boot_ns, uint64_t real_ns);
