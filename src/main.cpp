@@ -172,7 +172,8 @@ public:
 
 		std::string status = fail ? std::string("-") + strerror((int)-e->ret)
 					  : "fd " + std::to_string(e->ret);
-		std::string name = fail ? "open " + errnoName((int)-e->ret) : "open";
+		std::string name = fail ? "open " + errnoName((int)-e->ret) + " " + path
+					: "open " + path;
 
 		char flagbuf[16];
 		std::snprintf(flagbuf, sizeof(flagbuf), "0x%x", e->flags);
