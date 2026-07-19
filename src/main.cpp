@@ -54,6 +54,7 @@ struct Proc {
 
 struct Stats {
 	uint64_t execs = 0, forks = 0, exits = 0, opens = 0, open_fail = 0;
+	uint64_t nonzero_exits = 0, signaled = 0;
 	uint64_t rstats = 0; /* processes annotated with resource stats */
 };
 
@@ -70,6 +71,8 @@ public:
 		uint64_t parent = native_layout_ ? 0 : kOverviewUuid;
 		w_.counterTrack(kActiveUuid, parent, "Active processes");
 		w_.counterTrack(kFailedOpenUuid, parent, "Failed opens");
+		w_.counterTrack(kNonzeroExitUuid, parent, "Non-zero exits");
+		w_.counterTrack(kSignaledUuid, parent, "Signaled processes");
 		w_.counterTrack(kReadBytesUuid, parent,
 				"Cumulative bytes read", "bytes");
 		w_.counterTrack(kWriteBytesUuid, parent,
@@ -215,26 +218,47 @@ public:
 		}
 		int code = (e->exit_code >> 8) & 0xff;
 		int sig = e->exit_code & 0x7f;
-		char buf[64];
-		if (sig)
-			std::snprintf(buf, sizeof(buf), "killed by signal %d", sig);
-		else
-			std::snprintf(buf, sizeof(buf), "exit code %d", code);
+		char buf[96];
+		const char *outcome = "success";
+		if (sig) {
+			outcome = "signal";
+			stats_.signaled++;
+			w_.counter(kSignaledUuid, e->hdr.ts_ns, stats_.signaled);
+			const char *name = strsignal(sig);
+			std::snprintf(buf, sizeof(buf), "SIGNAL: %s (%d)",
+				      name ? name : "unknown", sig);
+		} else if (code) {
+			outcome = "non-zero exit";
+			stats_.nonzero_exits++;
+			w_.counter(kNonzeroExitUuid, e->hdr.ts_ns,
+				   stats_.nonzero_exits);
+			std::snprintf(buf, sizeof(buf), "FAILED: exit %d", code);
+		} else {
+			std::snprintf(buf, sizeof(buf), "exit 0");
+		}
 		w_.instant(p.thread_uuid, e->hdr.ts_ns, buf,
 			   {pt::Annotation::n("exit_code", code),
 			    pt::Annotation::n("term_signal", sig)});
+		std::vector<pt::Annotation> exit_annots = {
+			pt::Annotation::s("outcome", outcome),
+			pt::Annotation::n("exit_code", code),
+			pt::Annotation::n("term_signal", sig),
+		};
 
 		/* Resource stats ride this exit event (read off the task in the
 		 * kernel), so they land on the slice with no correlation dance. */
 		if (e->has_stats) {
-			w_.sliceEnd(p.thread_uuid, e->hdr.ts_ns, statAnnots(e));
+			auto resource_annots = statAnnots(e);
+			exit_annots.insert(exit_annots.end(), resource_annots.begin(),
+					   resource_annots.end());
+			w_.sliceEnd(p.thread_uuid, e->hdr.ts_ns, exit_annots);
 			read_bytes_ += e->read_bytes;
 			write_bytes_ += e->write_bytes;
 			w_.counter(kReadBytesUuid, e->hdr.ts_ns, read_bytes_);
 			w_.counter(kWriteBytesUuid, e->hdr.ts_ns, write_bytes_);
 			stats_.rstats++;
 		} else {
-			w_.sliceEnd(p.thread_uuid, e->hdr.ts_ns);
+			w_.sliceEnd(p.thread_uuid, e->hdr.ts_ns, exit_annots);
 		}
 		recordProc(p, e->hdr.ts_ns);
 		live_.erase(tgid);
@@ -302,11 +326,14 @@ public:
 			return false;
 		std::fprintf(f, "{\n  \"command\": %s,\n", jsonStr(cmd).c_str());
 		std::fprintf(f, "  \"counts\": {\"execs\": %llu, \"forks\": %llu, "
-			     "\"exits\": %llu, \"opens\": %llu, "
+			     "\"exits\": %llu, \"nonzero_exits\": %llu, "
+			     "\"signaled\": %llu, \"opens\": %llu, "
 			     "\"open_failed\": %llu, \"dropped\": %llu},\n",
 			     (unsigned long long)stats_.execs,
 			     (unsigned long long)stats_.forks,
 			     (unsigned long long)stats_.exits,
+			     (unsigned long long)stats_.nonzero_exits,
+			     (unsigned long long)stats_.signaled,
 			     (unsigned long long)stats_.opens,
 			     (unsigned long long)stats_.open_fail,
 			     (unsigned long long)dropped);
@@ -577,6 +604,8 @@ private:
 		if (!counters_started_) {
 			w_.counter(kActiveUuid, ts, 0);
 			w_.counter(kFailedOpenUuid, ts, 0);
+			w_.counter(kNonzeroExitUuid, ts, 0);
+			w_.counter(kSignaledUuid, ts, 0);
 			w_.counter(kReadBytesUuid, ts, 0);
 			w_.counter(kWriteBytesUuid, ts, 0);
 			counters_started_ = true;
@@ -605,9 +634,11 @@ private:
 	static constexpr uint64_t kOverviewUuid = 0x100;
 	static constexpr uint64_t kActiveUuid = kOverviewUuid + 1;
 	static constexpr uint64_t kFailedOpenUuid = kOverviewUuid + 2;
-	static constexpr uint64_t kReadBytesUuid = kOverviewUuid + 3;
-	static constexpr uint64_t kWriteBytesUuid = kOverviewUuid + 4;
-	uint64_t next_uuid_ = kOverviewUuid + 5;
+	static constexpr uint64_t kNonzeroExitUuid = kOverviewUuid + 3;
+	static constexpr uint64_t kSignaledUuid = kOverviewUuid + 4;
+	static constexpr uint64_t kReadBytesUuid = kOverviewUuid + 5;
+	static constexpr uint64_t kWriteBytesUuid = kOverviewUuid + 6;
+	uint64_t next_uuid_ = kOverviewUuid + 7;
 	uint64_t next_flow_id_ = 1;
 	uint64_t read_bytes_ = 0;
 	uint64_t write_bytes_ = 0;
@@ -1049,10 +1080,12 @@ int main(int argc, char **argv)
 	uint64_t dropped = skel->bss ? skel->bss->dropped : 0;
 	const Stats &s = model.stats();
 	fprintf(stderr,
-		"[proctrace] execs=%llu forks=%llu exits=%llu opens=%llu "
+		"[proctrace] execs=%llu forks=%llu exits=%llu "
+		"(nonzero=%llu signaled=%llu) opens=%llu "
 		"(failed=%llu) stats=%llu dropped=%llu\n",
 		(unsigned long long)s.execs, (unsigned long long)s.forks,
-		(unsigned long long)s.exits, (unsigned long long)s.opens,
+		(unsigned long long)s.exits, (unsigned long long)s.nonzero_exits,
+		(unsigned long long)s.signaled, (unsigned long long)s.opens,
 		(unsigned long long)s.open_fail, (unsigned long long)s.rstats,
 		(unsigned long long)dropped);
 	if (dropped)
