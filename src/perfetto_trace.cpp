@@ -150,33 +150,29 @@ void TraceWriter::writePacket(std::string &pkt, bool needs_incremental)
 	std::fwrite(framed.data(), 1, framed.size(), f_);
 }
 
-void TraceWriter::processTrack(uint64_t uuid, int32_t pid,
-			       const std::string &name)
+void TraceWriter::overviewRoot(uint64_t uuid, const std::string &name)
 {
-	std::string proc;                /* ProcessDescriptor */
-	putInt(proc, 1, pid);            /* pid */
-	putBytes(proc, 6, name);         /* process_name */
-
-	std::string td;                  /* TrackDescriptor */
+	std::string td;
 	putUint(td, 1, uuid);            /* uuid */
-	putBytes(td, 3, proc);           /* process */
+	putBytes(td, 2, name);           /* name */
+	putUint(td, 11, 2);              /* child_ordering = CHRONOLOGICAL */
 
 	std::string pkt;
-	putBytes(pkt, 60, td);           /* track_descriptor */
+	putBytes(pkt, 60, td);
 	writePacket(pkt);
 }
 
-void TraceWriter::threadTrack(uint64_t uuid, int32_t pid, int32_t tid,
-			      const std::string &name)
+void TraceWriter::overviewLane(uint64_t uuid, uint64_t parent_uuid,
+			       const std::string &name)
 {
-	std::string thr;                 /* ThreadDescriptor */
-	putInt(thr, 1, pid);             /* pid */
-	putInt(thr, 2, tid);             /* tid */
-	putBytes(thr, 5, name);          /* thread_name */
-
 	std::string td;
-	putUint(td, 1, uuid);
-	putBytes(td, 4, thr);            /* thread */
+	putUint(td, 1, uuid);            /* uuid */
+	putBytes(td, 2, name);           /* name */
+	putUint(td, 5, parent_uuid);     /* parent_uuid */
+	/* Do not merge same-named compiler lanes. This mode also makes the last
+	 * descriptor name authoritative, allowing exec to replace the provisional
+	 * fork-time label with its more useful argv-based label. */
+	putUint(td, 15, 2);              /* SIBLING_MERGE_BEHAVIOR_NONE */
 
 	std::string pkt;
 	putBytes(pkt, 60, td);

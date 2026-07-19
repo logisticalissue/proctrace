@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * perfetto_trace.h - a tiny, dependency-free writer for the subset of the
- * Perfetto trace protobuf we need. Uses the *standard* process/thread track
- * descriptors so the Perfetto UI groups and shows every process natively, plus
+ * Perfetto trace protobuf we need. Uses a generic root with one child track per
+ * process so a build opens as a compact, chronologically ordered group, plus
  * TrackEvent slices/instants and a ClockSnapshot. Packets stream straight to a
  * file, so writer memory stays O(live processes), not O(total events).
  *
@@ -16,9 +16,8 @@
  *   TracePacket.sequence_flags           = 13
  *   TracePacket.track_descriptor         = 60
  *   TracePacket.timestamp_clock_id       = 58
- *   TrackDescriptor{uuid=1, name=2, process=3, thread=4}
- *   ProcessDescriptor{pid=1, process_name=6}
- *   ThreadDescriptor{pid=1, tid=2, thread_name=5}
+ *   TrackDescriptor{uuid=1, name=2, parent_uuid=5, child_ordering=11,
+ *                   sibling_merge_behavior=15}
  *
  * Interning (dedups strings that recur across millions of events — repeated
  * open paths, annotation names, repeated annotation string values). Interned
@@ -61,11 +60,12 @@ public:
 	~TraceWriter();
 	bool ok() const { return f_ != nullptr; }
 
-	/* Standard descriptors: Perfetto groups thread tracks under the process
-	 * with the matching pid, and lists every process in the UI. */
-	void processTrack(uint64_t uuid, int32_t pid, const std::string &name);
-	void threadTrack(uint64_t uuid, int32_t pid, int32_t tid,
-			 const std::string &name);
+	/* Generic tracks can form a real hierarchy in the UI (unlike native
+	 * process/thread descriptors, whose grouping is controlled by Perfetto).
+	 * The overview root orders its children by their first event. */
+	void overviewRoot(uint64_t uuid, const std::string &name);
+	void overviewLane(uint64_t uuid, uint64_t parent_uuid,
+			  const std::string &name);
 
 	void sliceBegin(uint64_t track_uuid, uint64_t ts_ns,
 			const std::string &name,

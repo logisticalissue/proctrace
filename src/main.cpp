@@ -39,8 +39,7 @@
 /* ------------------------------------------------------------------ */
 
 struct Proc {
-	uint64_t proc_uuid = 0;   /* Perfetto ProcessDescriptor track   */
-	uint64_t thread_uuid = 0; /* ThreadDescriptor track (holds slices) */
+	uint64_t thread_uuid = 0; /* compact overview lane (holds slices) */
 	uint64_t start_ts = 0;
 	uint32_t pid = 0;
 	uint32_t ppid = 0;
@@ -59,9 +58,13 @@ struct Stats {
 
 class Model {
 public:
-	Model(pt::TraceWriter &w, const std::string &, bool trace_opens)
+	Model(pt::TraceWriter &w, const std::string &command, bool trace_opens)
 		: w_(w), trace_opens_(trace_opens),
-		  page_kb_(sysconf(_SC_PAGESIZE) / 1024) {}
+		  page_kb_(sysconf(_SC_PAGESIZE) / 1024)
+	{
+		w_.overviewRoot(kOverviewUuid,
+				"proctrace: " + ellipsize(command, 120));
+	}
 
 	void onFork(const pt_fork_event *e)
 	{
@@ -97,6 +100,10 @@ public:
 
 		std::string cmd = cmdline(e);
 		p.label = cmd; /* remembered for the teardown summary */
+		/* Re-emitting a generic descriptor updates its display name. Keep
+		 * enough argv to distinguish parallel compiler jobs, plus the PID. */
+		w_.overviewLane(p.thread_uuid, kOverviewUuid,
+				laneLabel(cmd, tgid));
 		std::vector<pt::Annotation> a = {
 			pt::Annotation::s("filename", e->filename),
 			pt::Annotation::n("pid", tgid),
@@ -491,9 +498,8 @@ private:
 		if (p.comm == comm)
 			return;
 		p.comm = comm;
-		w_.processTrack(p.proc_uuid, (int32_t)p.pid, p.comm);
-		w_.threadTrack(p.thread_uuid, (int32_t)p.pid, (int32_t)p.pid,
-			       p.comm);
+		w_.overviewLane(p.thread_uuid, kOverviewUuid,
+				laneLabel(p.comm, p.pid));
 	}
 
 	Proc &ensure(uint32_t tgid, uint64_t ts)
@@ -504,20 +510,24 @@ private:
 		Proc p;
 		p.pid = tgid;
 		p.start_ts = ts;
-		p.proc_uuid = next_uuid_++;
 		p.thread_uuid = next_uuid_++;
 		p.comm = "?";
-		w_.processTrack(p.proc_uuid, (int32_t)tgid, "pid " + std::to_string(tgid));
-		w_.threadTrack(p.thread_uuid, (int32_t)tgid, (int32_t)tgid,
-			       "pid " + std::to_string(tgid));
+		w_.overviewLane(p.thread_uuid, kOverviewUuid,
+				"pid " + std::to_string(tgid));
 		return live_.emplace(tgid, std::move(p)).first->second;
+	}
+
+	static std::string laneLabel(const std::string &command, uint32_t pid)
+	{
+		return ellipsize(command, 96) + " [" + std::to_string(pid) + "]";
 	}
 
 	pt::TraceWriter &w_;
 	bool trace_opens_;
 	int64_t page_kb_;
 	std::unordered_map<uint32_t, Proc> live_;
-	uint64_t next_uuid_ = 0x100;
+	static constexpr uint64_t kOverviewUuid = 0x100;
+	uint64_t next_uuid_ = kOverviewUuid + 1;
 	Stats stats_;
 
 	/* summary state: one record per finished process, one entry per unique
